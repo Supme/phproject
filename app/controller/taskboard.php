@@ -216,6 +216,35 @@ class Taskboard extends Base {
 			return;
 		}
 
+		if(!empty($params["filter"])) {
+			$filter = $params["filter"];
+		} else {
+			$filter = "groups";
+		}
+
+		switch($filter) {
+			case "groups":
+				$group_model = new \Model\User\Group();
+				$groups_result = $group_model->find(array("user_id = ?", $this->_userId));
+				$filter_users = array($this->_userId);
+				foreach($groups_result as $g) {
+					$filter_users[] = $g["group_id"];
+				}
+				$groups = implode(",", $filter_users);
+				$users_result = $group_model->find("group_id IN ({$groups})");
+				foreach($users_result as $u) {
+					$filter_users[] = $u["user_id"];
+				}
+				break;
+			case "me":
+				$filter_users = array($this->_userId);
+				break;
+		}
+
+		if(!empty($filter_users)) {
+			$filter = implode(",", $filter_users);
+		}
+
 		$visible_tasks = explode(",", $params["tasks"]);
 
 		// Visible tasks must have at least one key
@@ -244,47 +273,55 @@ class Taskboard extends Base {
 		$i = 1;
 
 		$db = $f3->get("db.instance");
+		$cache = \Cache::instance();
+		$prefix = "burn-" . $sprint->id . "-" . $filter . "-";
 
-		foreach($burnDates as $date){
+		foreach($burnDates as $date) {
 
-			//Get total_hours, which is the initial amount entered on each task, and cache this query
-			if($i == 1){
-				$burnDays[$date] =
-					$db->exec("
-						SELECT i.hours_total AS remaining
-						FROM issue i
-						WHERE i.id IN (". implode(",", $visible_tasks) .")
-						AND i.created_date < '" . $sprint->start_date  . " 00:00:00'", // Only count tasks added before sprint
-						NULL,
-						2678400 // 31 days
+			// Get total_hours, which is the initial amount entered on each task, and cache this query
+			if($i == 1) {
+				if($result = $cache->get($prefix . $date)) {
+					$burnDays[$date] = $result;
+				} else {
+					$burnDays[$date] =
+						$db->exec("
+							SELECT i.hours_total AS remaining
+							FROM issue i
+							WHERE i.id IN (". implode(",", $visible_tasks) .")
+							AND i.created_date < '" . $sprint->start_date  . " 00:00:00'" // Only count tasks added before sprint
+						);
+					$cache->set($prefix . $date, $burnDays[$date], 2678400); // Cache for 31 days
+				}
+			}
+
+			// Get between day values and cache them... this also will get the last day of completed sprints so they will be cached
+			else if($i < ($burnDatesCount - 1) || $burnComplete) {
+				if($result = $cache->get($prefix . $date)) {
+					$burnDays[$date] = $result;
+				} else {
+					$burnDays[$date] = $db->exec("
+						SELECT IF(f.new_value = '' OR f.new_value IS NULL, i.hours_total, f.new_value) AS remaining
+						FROM issue_update_field f
+						JOIN issue_update u ON u.id = f.issue_update_id
+						JOIN (
+							SELECT MAX(u.id) AS max_id
+							FROM issue_update u
+							JOIN issue_update_field f ON f.issue_update_id = u.id
+							WHERE f.field = 'hours_remaining'
+							AND u.created_date < '". $date . " 23:59:59'
+							GROUP BY u.issue_id
+						) a ON a.max_id = u.id
+						RIGHT JOIN issue i ON i.id = u.issue_id
+						WHERE (f.field = 'hours_remaining' OR f.field IS NULL)
+						AND i.id IN (". implode(",", $visible_tasks) . ")
+						AND i.created_date < '". $date . " 23:59:59'"
 					);
+					$cache->set($prefix . $date, $burnDays[$date], 2678400); // Cache for 31 days
+				}
 			}
 
-			//Get between day values and cache them... this also will get the last day of completed sprints so they will be cached
-			else if($i < ($burnDatesCount - 1) || $burnComplete ){
-				$burnDays[$date] = $db->exec("
-					SELECT IF(f.new_value = '' OR f.new_value IS NULL, i.hours_total, f.new_value) AS remaining
-					FROM issue_update_field f
-					JOIN issue_update u ON u.id = f.issue_update_id
-					JOIN (
-						SELECT MAX(u.id) AS max_id
-						FROM issue_update u
-						JOIN issue_update_field f ON f.issue_update_id = u.id
-						WHERE f.field = 'hours_remaining'
-						AND u.created_date < '". $date . " 23:59:59'
-						GROUP BY u.issue_id
-					) a ON a.max_id = u.id
-					RIGHT JOIN issue i ON i.id = u.issue_id
-					WHERE (f.field = 'hours_remaining' OR f.field IS NULL)
-					AND i.id IN (". implode(",", $visible_tasks) . ")
-					AND i.created_date < '". $date . " 23:59:59'",
-					NULL,
-					2678400 // 31 days
-				);
-			}
-
-			//Get the today's info and don't cache it
-			else{
+			// Get the today's info and don't cache it
+			else {
 				$burnDays[$date] =
 					$db->exec("
 						SELECT IF(f.new_value = '' OR f.new_value IS NULL, i.hours_total, f.new_value) AS remaining
@@ -308,7 +345,7 @@ class Taskboard extends Base {
 			$i++;
 		}
 
-		if(!$burnComplete){//add in empty days
+		if(!$burnComplete) { // add in empty days
 			$i = 0;
 			foreach($remainingDays as $day) {
 				if($i != 0){
@@ -318,19 +355,18 @@ class Taskboard extends Base {
 			}
 		}
 
-		//reformat the date and remove weekends
+		// reformat the date and remove weekends
 		$i = 0;
-		foreach($burnDays as $burnKey => $burnDay){
+		foreach($burnDays as $burnKey => $burnDay) {
 
 			$weekday = date("D", strtotime($burnKey));
 			$weekendDays = array("Sat","Sun");
 
-			if( !in_array($weekday, $weekendDays) ){
+			if (!in_array($weekday, $weekendDays)) {
 				$newDate = date("M j", strtotime($burnKey));
 				$burnDays[$newDate] = $burnDays[$burnKey];
 				unset($burnDays[$burnKey]);
-			}
-			else{//remove weekend days
+			} else { // remove weekend days
 				unset($burnDays[$burnKey]);
 			}
 
